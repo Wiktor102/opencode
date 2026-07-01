@@ -2,8 +2,10 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdir, unlink } from "fs/promises"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Effect, Layer } from "effect"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -59,6 +61,29 @@ afterEach(async () => {
   await disposeAllInstances()
 })
 
+// Stubbed HttpClient so model detection never reaches the real network.
+// `httpHandler` is consulted at request time, so each test can configure it
+// from inside its config/body before `yield* list` triggers detection.
+let httpHandler: (request: HttpClientRequest.HttpClientRequest) => Response = () =>
+  new Response(null, { status: 404 })
+
+// Per-test captures that handlers can populate and test bodies can assert.
+let capturedAuth: string | undefined
+
+const stubHttp = Layer.succeed(
+  HttpClient.HttpClient,
+  HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(request, httpHandler(request)))),
+)
+
+const resetHttpHandler = () => {
+  httpHandler = () => new Response(null, { status: 404 })
+  capturedAuth = undefined
+}
+
+afterEach(() => {
+  resetHttpHandler()
+})
+
 const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
@@ -71,7 +96,10 @@ const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       ModelsDev.node,
       RuntimeFlags.node,
     ]),
-    [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
+    [
+      [httpClient, stubHttp],
+      [RuntimeFlags.node, RuntimeFlags.layer(flags)],
+    ],
   )
 
 const list = Provider.use.list()
@@ -84,7 +112,9 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
-const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
+const it = testEffect(
+  LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node]), [[httpClient, stubHttp]]),
+)
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 
 const alphaProviderConfig = {
@@ -887,6 +917,212 @@ it.instance(
           options: { baseURL: "https://api.example.com/v1" },
         },
       },
+    },
+  },
+)
+
+it.instance(
+  "openai-compatible detection authenticates with options.apiKey when provider.key is undefined",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const provider = providers[ProviderV2.ID.make("detect-key")]
+    expect(provider).toBeDefined()
+    expect(provider.models["detected-model"]).toBeDefined()
+    expect(capturedAuth).toBe("Bearer options-key")
+  }),
+  {
+    config: () => {
+      httpHandler = (request) => {
+        if (request.url.endsWith("/models")) {
+          capturedAuth = request.headers.authorization
+          return new Response(JSON.stringify({ data: [{ id: "detected-model" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }
+        return new Response(null, { status: 404 })
+      }
+      return {
+        provider: {
+          "detect-key": {
+            name: "Detect Key",
+            npm: "@ai-sdk/openai-compatible",
+            env: [],
+            options: {
+              apiKey: "options-key",
+              baseURL: "http://detect.test/v1",
+            },
+          },
+        },
+      }
+    },
+  },
+)
+
+it.instance(
+  "openai-compatible detection keeps config-only models not returned by the API",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const models = providers[ProviderV2.ID.make("detect-mix")]?.models
+    expect(models).toBeDefined()
+    expect(models["api-model"]).toBeDefined()
+    expect(models["config-only-model"]).toBeDefined()
+  }),
+  {
+    config: () => {
+      httpHandler = (request) => {
+        if (request.url.endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [{ id: "api-model" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }
+        return new Response(null, { status: 404 })
+      }
+      return {
+        provider: {
+          "detect-mix": {
+            name: "Detect Mix",
+            npm: "@ai-sdk/openai-compatible",
+            env: [],
+            options: { apiKey: "key", baseURL: "http://detect-mix.test/v1" },
+            models: {
+              "config-only-model": {
+                name: "Config Only",
+                tool_call: true,
+                limit: { context: 8000, output: 2000 },
+              },
+            },
+          },
+        },
+      }
+    },
+  },
+)
+
+it.instance(
+  "openai-compatible detection filters out embedding models",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const models = providers[ProviderV2.ID.make("detect-embed")]?.models
+    expect(models).toBeDefined()
+    expect(models["chat-model"]).toBeDefined()
+    expect(models["text-embedding-foo"]).toBeUndefined()
+    expect(models["embed-bar"]).toBeUndefined()
+  }),
+  {
+    config: () => {
+      httpHandler = () =>
+        new Response(
+          JSON.stringify({ data: [{ id: "chat-model" }, { id: "text-embedding-foo" }, { id: "embed-bar" }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        )
+      return {
+        provider: {
+          "detect-embed": {
+            name: "Detect Embed",
+            npm: "@ai-sdk/openai-compatible",
+            env: [],
+            options: { apiKey: "key", baseURL: "http://detect-embed.test/v1" },
+          },
+        },
+      }
+    },
+  },
+)
+
+it.instance(
+  "openai-compatible detection failure preserves config models",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const models = providers[ProviderV2.ID.make("detect-fail")]?.models
+    expect(models).toBeDefined()
+    expect(models["config-model"]).toBeDefined()
+  }),
+  {
+    config: () => ({
+      provider: {
+        "detect-fail": {
+          name: "Detect Fail",
+          npm: "@ai-sdk/openai-compatible",
+          env: [],
+          options: { apiKey: "key", baseURL: "http://detect-fail.test/v1" },
+          models: {
+            "config-model": {
+              name: "Config Model",
+              tool_call: true,
+              limit: { context: 8000, output: 2000 },
+            },
+          },
+        },
+      },
+    }),
+  },
+)
+
+it.instance(
+  "openai-compatible detection sets api url and npm from provider config",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const model = providers[ProviderV2.ID.make("detect-meta")]?.models["detected-model"]
+    expect(model).toBeDefined()
+    expect(model.api.id).toBe("detected-model")
+    expect(model.api.url).toBe("http://detect-meta.test/v1")
+    expect(model.api.npm).toBe("@ai-sdk/openai-compatible")
+  }),
+  {
+    config: () => {
+      httpHandler = () =>
+        new Response(JSON.stringify({ data: [{ id: "detected-model" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })
+      return {
+        provider: {
+          "detect-meta": {
+            name: "Detect Meta",
+            npm: "@ai-sdk/openai-compatible",
+            env: [],
+            options: { apiKey: "key", baseURL: "http://detect-meta.test/v1" },
+          },
+        },
+      }
+    },
+  },
+)
+
+it.instance(
+  "openai-compatible detection authenticates with provider.key from env var",
+  Effect.gen(function* () {
+    yield* set("DETECT_ENV_KEY", "env-key-value")
+    const providers = yield* list
+    const provider = providers[ProviderV2.ID.make("detect-env")]
+    expect(provider).toBeDefined()
+    expect(provider.models["env-detected-model"]).toBeDefined()
+    expect(capturedAuth).toBe("Bearer env-key-value")
+  }),
+  {
+    config: () => {
+      httpHandler = (request) => {
+        if (request.url.endsWith("/models")) {
+          capturedAuth = request.headers.authorization
+          return new Response(JSON.stringify({ data: [{ id: "env-detected-model" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }
+        return new Response(null, { status: 404 })
+      }
+      return {
+        provider: {
+          "detect-env": {
+            name: "Detect Env",
+            npm: "@ai-sdk/openai-compatible",
+            env: ["DETECT_ENV_KEY"],
+            options: { baseURL: "http://detect-env.test/v1" },
+          },
+        },
+      }
     },
   },
 )

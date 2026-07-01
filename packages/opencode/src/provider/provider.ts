@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import os from "os"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import fuzzysort from "fuzzysort"
@@ -18,7 +19,8 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types } from "effect"
+import { Effect, Layer, Context, Option, Schema, Types } from "effect"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectPromise } from "@/effect/promise"
@@ -1299,6 +1301,166 @@ function modelSuggestions(provider: Info | undefined, modelID: ModelV2.ID, enabl
     .map((item) => item.id)
 }
 
+// Auto-detect models from OpenAI-compatible providers by calling their
+// `GET /v1/models` endpoint at startup. Ported from
+// https://github.com/anomalyco/opencode/pull/8359.
+//
+// Visibility rule: a model is visible if it is returned by the API OR listed
+// in the user's config file. Models.dev-only entries for the same provider
+// are dropped. Metadata precedence: API > config > Models.dev.
+namespace ProviderModelDetection {
+  function mergeModel(
+    detected: Partial<Model>,
+    existing: Model | undefined,
+    modelID: string,
+    providerID: string,
+    providerBaseURL: string,
+  ): Model {
+    return {
+      id: ModelV2.ID.make(modelID),
+      providerID: ProviderV2.ID.make(detected.providerID ?? existing?.providerID ?? providerID),
+      api: {
+        id: modelID,
+        url: detected.api?.url ?? existing?.api?.url ?? providerBaseURL,
+        npm: detected.api?.npm ?? existing?.api?.npm ?? "@ai-sdk/openai-compatible",
+      },
+      name: detected.name ?? existing?.name ?? modelID,
+      family: detected.family ?? existing?.family ?? "",
+      capabilities: {
+        temperature: detected.capabilities?.temperature ?? existing?.capabilities?.temperature ?? false,
+        reasoning: detected.capabilities?.reasoning ?? existing?.capabilities?.reasoning ?? false,
+        attachment: detected.capabilities?.attachment ?? existing?.capabilities?.attachment ?? false,
+        toolcall: detected.capabilities?.toolcall ?? existing?.capabilities?.toolcall ?? true,
+        input: {
+          text: detected.capabilities?.input?.text ?? existing?.capabilities?.input?.text ?? true,
+          audio: detected.capabilities?.input?.audio ?? existing?.capabilities?.input?.audio ?? false,
+          image: detected.capabilities?.input?.image ?? existing?.capabilities?.input?.image ?? false,
+          video: detected.capabilities?.input?.video ?? existing?.capabilities?.input?.video ?? false,
+          pdf: detected.capabilities?.input?.pdf ?? existing?.capabilities?.input?.pdf ?? false,
+        },
+        output: {
+          text: detected.capabilities?.output?.text ?? existing?.capabilities?.output?.text ?? true,
+          audio: detected.capabilities?.output?.audio ?? existing?.capabilities?.output?.audio ?? false,
+          image: detected.capabilities?.output?.image ?? existing?.capabilities?.output?.image ?? false,
+          video: detected.capabilities?.output?.video ?? existing?.capabilities?.output?.video ?? false,
+          pdf: detected.capabilities?.output?.pdf ?? existing?.capabilities?.output?.pdf ?? false,
+        },
+        interleaved: detected.capabilities?.interleaved ?? existing?.capabilities?.interleaved ?? false,
+      },
+      cost: {
+        input: detected.cost?.input ?? existing?.cost?.input ?? 0,
+        output: detected.cost?.output ?? existing?.cost?.output ?? 0,
+        cache: {
+          read: detected.cost?.cache?.read ?? existing?.cost?.cache?.read ?? 0,
+          write: detected.cost?.cache?.write ?? existing?.cost?.cache?.write ?? 0,
+        },
+      },
+      limit: {
+        context: detected.limit?.context ?? existing?.limit?.context ?? 0,
+        input: detected.limit?.input ?? existing?.limit?.input,
+        output: detected.limit?.output ?? existing?.limit?.output ?? 0,
+      },
+      status: detected.status ?? existing?.status ?? "active",
+      options: mergeDeep(existing?.options ?? {}, detected.options ?? {}),
+      headers: mergeDeep(existing?.headers ?? {}, detected.headers ?? {}),
+      release_date: detected.release_date ?? existing?.release_date ?? "",
+      variants: existing?.variants ?? {},
+    }
+  }
+
+  const OpenAIModelsResponse = Schema.Struct({
+    data: optional(Schema.Array(Schema.Struct({ id: optional(Schema.String) }))),
+  })
+
+  const openAICompatibleDetect = Effect.fnUntraced(function* (
+    http: HttpClient.HttpClient,
+    baseURL: string,
+    apiKey?: string,
+  ) {
+    const request = HttpClientRequest.get(`${baseURL}/models`).pipe(HttpClientRequest.acceptJson)
+    const response = yield* http.execute(apiKey ? request.pipe(HttpClientRequest.bearerToken(apiKey)) : request).pipe(
+      Effect.timeoutOrElse({
+        duration: "3 seconds",
+        orElse: () => Effect.fail(new Error("model detection request timed out")),
+      }),
+    )
+    if (response.status >= 400) return yield* Effect.fail(new Error(`bad http status ${response.status}`))
+
+    const body = yield* HttpClientResponse.schemaBodyJson(OpenAIModelsResponse)(response).pipe(
+      Effect.mapError((error) => new Error(`failed to decode models response: ${error.message}`)),
+    )
+
+    return Object.fromEntries(
+      (body.data ?? [])
+        .filter(
+          (m): m is { id: string } =>
+            typeof m.id === "string" && !!m.id && !m.id.includes("embedding") && !m.id.includes("embed"),
+        )
+        .map((m) => [m.id, {}]),
+    )
+  })
+
+  function resolveAPIKey(provider: Info): string {
+    return (provider.options["apiKey"] as string | undefined) ?? provider.key ?? ""
+  }
+
+  export const populate = Effect.fn("ProviderModelDetection.populate")(function* (
+    http: HttpClient.HttpClient,
+    provider: Info,
+    configProvider:
+      | {
+          npm?: string
+          api?: string
+          options?: { baseURL?: string; [k: string]: unknown }
+          models?: Record<string, unknown>
+        }
+      | undefined,
+    modelsDevProvider: { npm?: string; api?: string } | undefined,
+  ) {
+    if (provider.id === "opencode") return
+
+    const providerNPM = configProvider?.npm ?? modelsDevProvider?.npm ?? "@ai-sdk/openai-compatible"
+    const providerBaseURL = configProvider?.options?.baseURL ?? configProvider?.api ?? modelsDevProvider?.api ?? ""
+    if (providerNPM !== "@ai-sdk/openai-compatible" || !providerBaseURL) return
+
+    const apiKey = resolveAPIKey(provider)
+    const detected = yield* openAICompatibleDetect(http, providerBaseURL, apiKey).pipe(
+      Effect.tapError((error) => {
+        const status = Number(error.message.match(/status (\d+)/)?.[1] ?? 0)
+        const hint =
+          status === 401 || status === 403
+            ? apiKey
+              ? "the configured apiKey was rejected by the server (check that it is correct, has not expired, and is authorized for this endpoint)"
+              : "no apiKey was resolved (set provider.options.apiKey in config, or provider.env, or use `opencode auth login`); the server returned an auth error"
+            : "check the server URL and that it exposes GET /v1/models"
+        return Effect.logWarning("[provider.model-detection] failed to detect models", {
+          providerID: provider.id,
+          baseURL: providerBaseURL,
+          reason: error.message,
+          hint,
+        })
+      }),
+      Effect.option,
+    )
+
+    const models = Option.getOrUndefined(detected)
+    if (!models || Object.keys(models).length === 0) return
+
+    const configModels = (configProvider?.models ?? {}) as Record<string, unknown>
+    const visible = new Set([...Object.keys(models), ...Object.keys(configModels)])
+
+    // Drop models that exist only in Models.dev (visibility: API ∪ config).
+    for (const id of Object.keys(provider.models)) {
+      if (!visible.has(id)) delete provider.models[id]
+    }
+
+    // For each visible model returned by the API, merge API > config > Models.dev.
+    for (const id of Object.keys(models)) {
+      provider.models[id] = mergeModel(models[id], provider.models[id], id, provider.id, providerBaseURL)
+    }
+  })
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -1309,6 +1471,7 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
+    const http = yield* HttpClient.HttpClient
 
     const state = yield* InstanceState.make<State>(() =>
       Effect.gen(function* () {
@@ -1500,6 +1663,7 @@ const layer = Layer.effect(
 
         // load apikeys
         const auths = yield* auth.all().pipe(Effect.orDie)
+
         for (const [id, provider] of Object.entries(auths)) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
@@ -1573,6 +1737,22 @@ const layer = Layer.effect(
             } catch (e) {}
           })
         }
+
+        // Auto-detect models for OpenAI-compatible providers (PR #8359).
+        // Runs in parallel; failures are isolated to the individual provider.
+        const openaiCompatibleTargets = Object.entries(providers).filter(([id, p]) =>
+          isProviderAllowed(ProviderV2.ID.make(id)),
+        )
+        yield* Effect.forEach(
+          openaiCompatibleTargets,
+          ([id, provider]) =>
+            ProviderModelDetection.populate(http, provider, cfg.provider?.[id], modelsDev[id]).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("[provider.model-detection] populate failed", { id, cause }),
+              ),
+            ),
+          { concurrency: "unbounded", discard: true },
+        )
 
         for (const [id, provider] of Object.entries(providers)) {
           const providerID = ProviderV2.ID.make(id)
@@ -1971,7 +2151,7 @@ export function parseModel(model: string) {
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, Config.node, Auth.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node],
+  deps: [FSUtil.node, Config.node, Auth.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node, httpClient],
 })
 
 export * as Provider from "./provider"
